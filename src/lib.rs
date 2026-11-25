@@ -398,12 +398,8 @@ pub struct StatusInfo {
 }
 
 fn render_hostapd_conf(capability: &Capability, config: &HotspotConfig) -> Result<String> {
-    let channel = capability
-        .channel
-        .context("the uplink has no channel; connect to a Wi-Fi network first")?;
-    let band = capability
-        .band
-        .context("the uplink frequency could not be classified")?;
+    let channel = capability.channel.unwrap_or(1);
+    let band = capability.band.unwrap_or(Band::B2_4);
     Ok(format!(
         "interface={}\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\ncountry_code={}\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n",
         config.ap_interface,
@@ -622,7 +618,7 @@ fn wait_for_uplink(interface: &str) {
 }
 
 fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String, Option<String>)>)> {
-    if capability.band == Some(Band::B2_4) {
+    if capability.band != Some(Band::B5) && capability.band != Some(Band::B6) {
         return Ok((capability.clone(), None));
     }
     let name = stdout("nmcli", &["-g", "GENERAL.CONNECTION", "dev", "show", &capability.uplink])?
@@ -726,12 +722,8 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
             capability.combinations.join("\n")
         );
     }
-    let channel = capability
-        .channel
-        .context("the uplink has no channel; connect to a Wi-Fi network first")?;
-    let band = capability
-        .band
-        .context("the uplink frequency could not be classified")?;
+    let channel = capability.channel.unwrap_or(1);
+    let band = capability.band.unwrap_or(Band::B2_4);
     let switch_note = if band != Band::B2_4 {
         "Switch    uplink will be limited to 2.4 GHz for the AP\n".to_string()
     } else {
@@ -803,22 +795,21 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         Some((name, old)) => (Some(name), old),
         None => (None, None),
     };
-    let net_source = config
-        .uplink
-        .clone()
-        .unwrap_or_else(|| capability.uplink.clone());
+    let net_source = config.uplink.clone().unwrap_or_else(|| {
+        if uplink_gateway(&capability.uplink).is_ok() {
+            capability.uplink.clone()
+        } else {
+            sources().into_iter().next().unwrap_or_else(|| capability.uplink.clone())
+        }
+    });
     let source_gateway = uplink_gateway(&net_source)
         .with_context(|| format!("{net_source} has no default route; pick another internet source"))?;
     let notice = pinned_connection
         .as_ref()
         .map(|_| "uplink limited to 2.4 GHz for the AP".to_string());
 
-    let channel = capability
-        .channel
-        .context("the uplink has no channel; connect to a Wi-Fi network first")?;
-    let band = capability
-        .band
-        .context("the uplink frequency could not be classified")?;
+    let channel = capability.channel.unwrap_or(1);
+    let band = capability.band.unwrap_or(Band::B2_4);
 
     fs::create_dir_all(RUN_DIR)?;
     fs::write(HOSTAPD_CONF, render_hostapd_conf(&capability, config)?)?;

@@ -127,23 +127,23 @@ fn handle_msg(msg: Msg, ui: &Ui) {
     match msg {
         Msg::Refresh(info) => {
             if let Some(cap) = &info.capability {
-                ui.uplink.set_subtitle(&format!(
+                ui.uplink.set_subtitle(&escaped(&format!(
                     "{} / {} / {}",
                     cap.uplink,
                     cap.uplink_ssid.as_deref().unwrap_or("<hidden>"),
                     cap.phy
-                ));
+                )));
                 match (cap.channel, cap.frequency_mhz, cap.band) {
-                    (Some(channel), Some(freq), Some(band)) => ui
-                        .channel
-                        .set_subtitle(&format!("{} — {} MHz, {}", channel, freq, band.label())),
+                    (Some(channel), Some(freq), Some(band)) => ui.channel.set_subtitle(&escaped(
+                        &format!("{} — {} MHz, {}", channel, freq, band.label()),
+                    )),
                     _ => ui.channel.set_subtitle("not connected"),
                 }
-                ui.mode.set_subtitle(&format!(
+                ui.mode.set_subtitle(&escaped(&format!(
                     "{} · same channel {}",
                     if cap.concurrent { "supported" } else { "unsupported" },
                     if cap.same_channel_required { "required" } else { "optional" }
-                ));
+                )));
 
                 {
                     let mut added = ui.combo_rows.lock().unwrap();
@@ -157,10 +157,10 @@ fn handle_msg(msg: Msg, ui: &Ui) {
                         added.push(row);
                     }
                 }
-                ui.combos.set_subtitle(&format!(
+                ui.combos.set_subtitle(&escaped(&format!(
                     "{} reported by the driver",
                     cap.combinations.len()
-                ));
+                )));
             } else {
                 ui.uplink.set_subtitle("adapter unavailable");
                 ui.channel.set_subtitle("—");
@@ -168,12 +168,12 @@ fn handle_msg(msg: Msg, ui: &Ui) {
             }
 
             match &info.state {
-                Some(state) => ui.session.set_subtitle(&format!(
+                Some(state) => ui.session.set_subtitle(&escaped(&format!(
                     "{} — {} on {}",
                     if info.running { "running" } else { "stale" },
                     state.ssid,
                     state.ap_interface
-                )),
+                ))),
                 None => ui.session.set_subtitle("not running"),
             }
 
