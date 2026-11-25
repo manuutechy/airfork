@@ -212,8 +212,8 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("airfork")
-        .default_width(480)
-        .default_height(640)
+        .default_width(940)
+        .default_height(660)
         .build();
 
     let header = adw::HeaderBar::new();
@@ -284,37 +284,63 @@ fn build_ui(app: &adw::Application) {
         .title("Clients")
         .description("devices joined to the hotspot")
         .build();
-    page.add(&client_group);
 
+    // two columns so the window uses the desktop when it is opened wide
     let root = Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(16)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(16)
+        .margin_bottom(16)
+        .build();
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+
+    let left = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(12)
         .build();
-    let clamp = adw::Clamp::new();
-    clamp.set_maximum_size(560);
-    clamp.set_child(Some(&page));
-    root.append(&clamp);
+    left.set_hexpand(true);
+    left.set_vexpand(true);
+    let left_clamp = adw::Clamp::new();
+    left_clamp.set_maximum_size(460);
+    left_clamp.set_child(Some(&page));
+    left_clamp.set_hexpand(true);
+    left_clamp.set_vexpand(true);
+    left.append(&left_clamp);
 
     let actions = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
-        .margin_start(24)
-        .margin_end(24)
+        .halign(gtk4::Align::Start)
         .build();
     let start = Button::with_label("Start hotspot");
     start.add_css_class("suggested-action");
     let stop = Button::with_label("Stop hotspot");
     actions.append(&start);
     actions.append(&stop);
-    root.append(&actions);
+    left.append(&actions);
+
+    let right = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(12)
+        .build();
+    right.set_hexpand(true);
+    right.set_vexpand(true);
+    let client_page = adw::PreferencesPage::new();
+    client_page.add(&client_group);
+    let right_clamp = adw::Clamp::new();
+    right_clamp.set_maximum_size(460);
+    right_clamp.set_child(Some(&client_page));
+    right_clamp.set_hexpand(true);
+    right.append(&right_clamp);
 
     let output = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(6)
-        .margin_start(24)
-        .margin_end(24)
-        .margin_bottom(16)
         .build();
+    output.set_vexpand(true);
     let output_label = Label::builder().label("Output").xalign(0.0).build();
     output_label.add_css_class("dim-label");
     let log_view = TextView::builder()
@@ -322,14 +348,19 @@ fn build_ui(app: &adw::Application) {
         .wrap_mode(WrapMode::Word)
         .build();
     log_view.add_css_class("monospace");
-    log_view.set_height_request(120);
+    log_view.set_height_request(160);
+    log_view.set_vexpand(true);
     let scroller = ScrolledWindow::builder()
         .child(&log_view)
-        .min_content_height(120)
+        .min_content_height(160)
         .build();
+    scroller.set_vexpand(true);
     output.append(&output_label);
     output.append(&scroller);
-    root.append(&output);
+    right.append(&output);
+
+    root.append(&left);
+    root.append(&right);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
