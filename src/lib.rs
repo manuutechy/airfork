@@ -19,6 +19,9 @@ pub const HOSTAPD_PID: &str = "/run/airfork/hostapd.pid";
 pub const DNSMASQ_PID: &str = "/run/airfork/dnsmasq.pid";
 pub const HOSTAPD_LOG: &str = "/run/airfork/hostapd.log";
 pub const NM_CONF: &str = "/etc/NetworkManager/conf.d/99-airfork.conf";
+pub const DHCP_LEASES: &str = "/run/airfork/dnsmasq.leases";
+pub const CLIENT_SUBNET: &str = "192.168.42.0/24";
+pub const ROUTE_TABLE: &str = "42";
 
 // locally administered, so it never collides with the station MAC
 pub const AP_MAC: &str = "02:00:00:00:01:01";
@@ -321,6 +324,7 @@ pub struct HotspotConfig {
     pub password: String,
     pub ap_interface: String,
     pub country: String,
+    pub uplink: Option<String>,
 }
 
 impl Default for HotspotConfig {
@@ -330,6 +334,7 @@ impl Default for HotspotConfig {
             password: "airfork-2026".into(),
             ap_interface: "wlan0_ap".into(),
             country: "KE".into(),
+            uplink: None,
         }
     }
 }
@@ -357,6 +362,11 @@ impl HotspotConfig {
         if self.country.len() != 2 || !self.country.chars().all(|c| c.is_ascii_alphanumeric()) {
             bail!("country code must be two ASCII alphanumeric characters");
         }
+        if let Some(source) = &self.uplink {
+            if source.trim().is_empty() || source.contains(char::is_whitespace) {
+                bail!("internet source must be a single interface name");
+            }
+        }
         Ok(())
     }
 }
@@ -364,6 +374,7 @@ impl HotspotConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeState {
     pub uplink: String,
+    pub net_source: String,
     pub ap_interface: String,
     pub channel: u8,
     pub band: String,
@@ -375,6 +386,7 @@ pub struct RuntimeState {
     pub pinned_connection: Option<String>,
     pub band_before: Option<String>,
     pub btm_before: Option<String>,
+    pub uplink_gateway: String,
     pub notice: Option<String>,
 }
 
@@ -405,9 +417,177 @@ fn render_hostapd_conf(capability: &Capability, config: &HotspotConfig) -> Resul
 
 fn render_dnsmasq_conf(config: &HotspotConfig) -> String {
     format!(
-        "interface={}\nbind-interfaces\ndhcp-range={}\npid-file={}\n",
-        config.ap_interface, DHCP_RANGE, DNSMASQ_PID
+        "interface={}\nbind-interfaces\ndhcp-range={}\npid-file={}\ndhcp-leasefile={}\n",
+        config.ap_interface, DHCP_RANGE, DNSMASQ_PID, DHCP_LEASES
     )
+}
+
+// clients have to leave through wlan0 even when Ethernet owns the default
+// route, otherwise the MASQUERADE rule on wlan0 never matches their packets
+fn uplink_gateway(interface: &str) -> Result<String> {
+    let routes = stdout("ip", &["-4", "route", "show", "default", "dev", interface])?;
+    routes
+        .split_whitespace()
+        .skip_while(|word| *word != "via")
+        .nth(1)
+        .map(str::to_string)
+        .context("could not find the gateway for the uplink")
+}
+
+fn route_clients(gateway: &str, interface: &str) -> Result<()> {
+    let existing = stdout("ip", &["rule", "show"])
+        .unwrap_or_default()
+        .contains(CLIENT_SUBNET);
+    if !existing {
+        run(
+            "ip",
+            &[
+                "rule",
+                "add",
+                "from",
+                CLIENT_SUBNET,
+                "table",
+                ROUTE_TABLE,
+                "priority",
+                "100",
+            ],
+        )?;
+    }
+    let args = [
+        "route",
+        "replace",
+        "default",
+        "via",
+        gateway,
+        "dev",
+        interface,
+        "table",
+        ROUTE_TABLE,
+    ];
+    run("ip", &args)?;
+    // a reconnect can wipe the table while the session is being set up
+    for _ in 0..4 {
+        let table = stdout("ip", &["route", "show", "table", ROUTE_TABLE])
+            .unwrap_or_default();
+        if table.contains("default") {
+            return Ok(());
+        }
+        run("ip", &args)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn unroute_clients(gateway: &str, interface: &str) {
+    let _ = run(
+        "ip",
+        &[
+            "rule",
+            "del",
+            "from",
+            CLIENT_SUBNET,
+            "table",
+            ROUTE_TABLE,
+            "priority",
+            "100",
+        ],
+    );
+    let _ = run(
+        "ip",
+        &[
+            "route",
+            "del",
+            "default",
+            "via",
+            gateway,
+            "dev",
+            interface,
+            "table",
+            ROUTE_TABLE,
+        ],
+    );
+}
+
+/// A device joined to the virtual access point, with its DHCP address if known.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+    pub connected: bool,
+}
+
+/// Interfaces that currently have an IPv4 default route, offered as internet sources.
+pub fn sources() -> Vec<String> {
+    let routes = stdout("ip", &["-4", "route", "show", "default"])
+        .unwrap_or_default();
+    let mut found = Vec::new();
+    for line in routes.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let Some(index) = words.iter().position(|word| *word == "dev") {
+            if let Some(name) = words.get(index + 1) {
+                if !found.contains(&(*name).to_string()) {
+                    found.push((*name).to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Reads dnsmasq leases and the hostapd station table. Read only.
+pub fn clients() -> Vec<ClientInfo> {
+    use std::collections::BTreeMap;
+
+    let state: Option<RuntimeState> = fs::read_to_string(STATE_FILE)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok());
+    let mut found: BTreeMap<String, ClientInfo> = BTreeMap::new();
+
+    if let Ok(leases) = fs::read_to_string(DHCP_LEASES) {
+        for line in leases.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 3 {
+                continue;
+            }
+            let hostname = if fields[3.min(fields.len() - 1)] == "*" {
+                None
+            } else {
+                Some(fields[3.min(fields.len() - 1)].to_string())
+            };
+            found.insert(
+                fields[1].to_string(),
+                ClientInfo {
+                    mac: fields[1].to_string(),
+                    ip: Some(fields[2].to_string()),
+                    hostname,
+                    connected: false,
+                },
+            );
+        }
+    }
+
+    if let Some(state) = state {
+        if let Ok(table) = stdout("iw", &["dev", &state.ap_interface, "station", "dump"]) {
+            for line in table.lines() {
+                let line = line.trim();
+                if let Some(mac) = line.strip_prefix("Station ") {
+                    let mac = mac.split_whitespace().next().unwrap_or("").to_string();
+                    found
+                        .entry(mac.clone())
+                        .or_insert(ClientInfo {
+                            mac: mac.clone(),
+                            ip: None,
+                            hostname: None,
+                            connected: false,
+                        })
+                        .connected = true;
+                }
+            }
+        }
+    }
+
+    found.into_values().collect()
 }
 
 fn read_pid(path: &str) -> Result<u32> {
@@ -424,6 +604,23 @@ fn process_alive(pid: u32) -> bool {
 
 // band limit, not BSSID pin. a pin stops the card from recovering when the
 // router kicks it off with a BSS transition request.
+// nmcli blocks on full activation by default, which can take a minute. cap
+// that wait and then poll for the link and address ourselves.
+fn wait_for_uplink(interface: &str) {
+    for _ in 0..30 {
+        let linked = stdout("iw", &["dev", interface, "link"])
+            .map(|text| text.contains("Connected to"))
+            .unwrap_or(false);
+        let addressed = stdout("ip", &["-4", "addr", "show", interface])
+            .map(|text| text.contains("inet "))
+            .unwrap_or(false);
+        if linked && addressed {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String, Option<String>)>)> {
     if capability.band == Some(Band::B2_4) {
         return Ok((capability.clone(), None));
@@ -440,14 +637,12 @@ fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String
     let previous = if previous.is_empty() { None } else { Some(previous) };
 
     run("nmcli", &["con", "mod", &name, "802-11-wireless.band", "bg"])?;
-    if let Err(error) = run("nmcli", &["con", "up", &name]) {
-        let _ = restore_band(&name, &previous);
-        return Err(error);
-    }
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = run("nmcli", &["con", "up", &name]);
+    wait_for_uplink(&capability.uplink);
     let updated = detect()?;
     if updated.band != Some(Band::B2_4) {
         let _ = restore_band(&name, &previous);
+        let _ = run("nmcli", &["con", "up", &name]);
         bail!("the uplink did not move to 2.4 GHz; hotspot not started");
     }
     Ok((updated, Some((name, previous))))
@@ -549,7 +744,8 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
          Virtual AP  {} with MAC {}\n\
          Hotspot     \"{}\" on {} channel {} (WPA2)\n\
          Network     192.168.42.0/24, DHCP 192.168.42.10 through 100\n\
-         Sharing     NAT from {} to {} via iptables\n\
+         Source      internet via {}\n\
+         Sharing     NAT from {} to {} via iptables and policy routing\n\
          Cleanup     airfork stop removes interface, daemons, NAT rule and state\n\
          Note        one radio, so the two roles share throughput\n",
         capability.uplink,
@@ -562,8 +758,9 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
         config.ssid,
         ap_band.label(),
         ap_channel,
+        config.uplink.as_deref().unwrap_or(&capability.uplink),
         config.ap_interface,
-        capability.uplink
+        config.uplink.as_deref().unwrap_or(&capability.uplink)
     ))
 }
 
@@ -591,13 +788,27 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         stop().context("could not clear the previous session")?;
     }
 
-    let (capability, pin) = ensure_ap_band(&capability)?;
+    // ignore the router's band-steering before the station changes channel
+    let btm_before = read_btm(&capability.uplink);
+    set_btm(&capability.uplink, "1");
+
+    let (capability, pin) = match ensure_ap_band(&capability) {
+        Ok(value) => value,
+        Err(error) => {
+            set_btm(&capability.uplink, btm_before.as_deref().unwrap_or("0"));
+            return Err(error);
+        }
+    };
     let (pinned_connection, band_before) = match pin {
         Some((name, old)) => (Some(name), old),
         None => (None, None),
     };
-    let btm_before = read_btm(&capability.uplink);
-    set_btm(&capability.uplink, "1");
+    let net_source = config
+        .uplink
+        .clone()
+        .unwrap_or_else(|| capability.uplink.clone());
+    let source_gateway = uplink_gateway(&net_source)
+        .with_context(|| format!("{net_source} has no default route; pick another internet source"))?;
     let notice = pinned_connection
         .as_ref()
         .map(|_| "uplink limited to 2.4 GHz for the AP".to_string());
@@ -666,14 +877,15 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         run("dnsmasq", &["-C", DNSMASQ_CONF])?;
         let dnsmasq_pid = read_pid(DNSMASQ_PID)?;
 
-        // comment on the rule so stop() can find exactly this one
+        // source-based NAT, so it works even when another interface owns the
+        // default route or the policy route gets rewritten later
         let nat_args = [
             "-t",
             "nat",
             "-C",
             "POSTROUTING",
-            "-o",
-            &capability.uplink,
+            "-s",
+            CLIENT_SUBNET,
             "-j",
             "MASQUERADE",
             "-m",
@@ -692,10 +904,12 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             run("iptables", &add_args)?;
         }
 
+        route_clients(&source_gateway, &net_source)?;
         fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")?;
 
         Ok(RuntimeState {
             uplink: capability.uplink.clone(),
+            net_source: net_source.clone(),
             ap_interface: config.ap_interface.clone(),
             channel,
             band: band.label().to_string(),
@@ -707,6 +921,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             pinned_connection: pinned_connection.clone(),
             band_before: band_before.clone(),
             btm_before: btm_before.clone(),
+            uplink_gateway: source_gateway.clone(),
             notice: notice.clone(),
         })
     })();
@@ -730,8 +945,8 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                     "nat",
                     "-D",
                     "POSTROUTING",
-                    "-o",
-                    &capability.uplink,
+                    "-s",
+                    CLIENT_SUBNET,
                     "-j",
                     "MASQUERADE",
                     "-m",
@@ -740,6 +955,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                     NAT_COMMENT,
                 ],
             );
+            unroute_clients(&source_gateway, &net_source);
             let _ = fs::write(
                 "/proc/sys/net/ipv4/ip_forward",
                 format!("{}\n", forward_before),
@@ -784,8 +1000,8 @@ pub fn stop() -> Result<()> {
             "nat",
             "-D",
             "POSTROUTING",
-            "-o",
-            &state.uplink,
+            "-s",
+            CLIENT_SUBNET,
             "-j",
             "MASQUERADE",
             "-m",
@@ -794,6 +1010,25 @@ pub fn stop() -> Result<()> {
             NAT_COMMENT,
         ],
     );
+    // older sessions used an interface-scoped rule with the same comment
+    let _ = run(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-o",
+            &state.net_source,
+            "-j",
+            "MASQUERADE",
+            "-m",
+            "comment",
+            "--comment",
+            NAT_COMMENT,
+        ],
+    );
+    unroute_clients(&state.uplink_gateway, &state.net_source);
     let _ = fs::write(
         "/proc/sys/net/ipv4/ip_forward",
         format!("{}\n", state.ip_forward_before),

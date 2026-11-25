@@ -11,10 +11,11 @@ use adw::prelude::*;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use airfork::{status, HotspotConfig, StatusInfo};
+use airfork::{clients, sources, status, HotspotConfig, StatusInfo};
 
 enum Msg {
     Refresh(StatusInfo),
+    Clients(Vec<airfork::ClientInfo>),
     Started(Result<String, String>),
     Stopped(Result<(), String>),
 }
@@ -29,6 +30,9 @@ struct Ui {
     session: adw::ActionRow,
     combos: adw::ExpanderRow,
     combo_rows: Arc<Mutex<Vec<adw::ActionRow>>>,
+    source: adw::ComboRow,
+    clients: adw::PreferencesGroup,
+    client_rows: Arc<Mutex<Vec<adw::ActionRow>>>,
     log: TextView,
 }
 
@@ -43,6 +47,13 @@ fn main() {
 // adw row titles go through pango markup, and capability strings contain "<="
 fn escaped(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn selected_string(combo: &adw::ComboRow) -> Option<String> {
+    combo
+        .selected_item()
+        .and_then(|item| item.downcast::<gtk4::StringObject>().ok())
+        .map(|item| item.string().to_string())
 }
 
 fn log(view: &TextView, line: &str) {
@@ -79,6 +90,36 @@ fn privileged(args: &[String]) -> Result<String> {
         Ok(stdout)
     } else {
         anyhow::bail!("{}", if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn update_clients(ui: &Ui, list: Vec<airfork::ClientInfo>) {
+    let mut rows = ui.client_rows.lock().unwrap();
+    for row in rows.iter() {
+        ui.clients.remove(row);
+    }
+    rows.clear();
+    if list.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("No clients connected")
+            .subtitle("devices will appear here when they join")
+            .build();
+        ui.clients.add(&row);
+        rows.push(row);
+    }
+    for client in list {
+        let title = client.hostname.as_deref().unwrap_or(&client.mac).to_string();
+        let subtitle = format!(
+            "{} · {}",
+            client.ip.as_deref().unwrap_or("no address"),
+            if client.connected { "connected" } else { "leased" }
+        );
+        let row = adw::ActionRow::builder()
+            .title(escaped(&title))
+            .subtitle(escaped(&subtitle))
+            .build();
+        ui.clients.add(&row);
+        rows.push(row);
     }
 }
 
@@ -135,7 +176,22 @@ fn handle_msg(msg: Msg, ui: &Ui) {
                 )),
                 None => ui.session.set_subtitle("not running"),
             }
+
+            let previous_source = selected_string(&ui.source);
+            let model = gtk4::StringList::new(&[] as &[&str]);
+            let mut selected = 0u32;
+            for (index, source) in sources().iter().enumerate() {
+                model.append(source);
+                if previous_source.as_deref() == Some(source.as_str()) {
+                    selected = index as u32;
+                }
+            }
+            ui.source.set_model(Some(&model));
+            ui.source.set_selected(selected);
+
+            update_clients(ui, clients());
         }
+        Msg::Clients(list) => update_clients(ui, list),
         Msg::Started(result) => match result {
             Ok(text) => {
                 log(&ui.log, "started");
@@ -216,6 +272,20 @@ fn build_ui(app: &adw::Application) {
     hotspot.add(&iface);
     page.add(&hotspot);
 
+    let source_group = adw::PreferencesGroup::builder()
+        .title("Internet source")
+        .description("which interface carries the hotspot traffic")
+        .build();
+    let source = adw::ComboRow::builder().title("Share connection from").build();
+    source_group.add(&source);
+    page.add(&source_group);
+
+    let client_group = adw::PreferencesGroup::builder()
+        .title("Clients")
+        .description("devices joined to the hotspot")
+        .build();
+    page.add(&client_group);
+
     let root = Box::builder()
         .orientation(Orientation::Vertical)
         .spacing(12)
@@ -274,6 +344,9 @@ fn build_ui(app: &adw::Application) {
         session: session.clone(),
         combos: combos.clone(),
         combo_rows: Arc::new(Mutex::new(Vec::new())),
+        source: source.clone(),
+        clients: client_group.clone(),
+        client_rows: Arc::new(Mutex::new(Vec::new())),
         log: log_view.clone(),
     };
 
@@ -286,6 +359,14 @@ fn build_ui(app: &adw::Application) {
             handle_msg(msg, &ui_state);
         }
         drop(items);
+        glib::ControlFlow::Continue
+    });
+
+    let timer_queue = queue.clone();
+    glib::source::timeout_add_local(std::time::Duration::from_secs(2), move || {
+        let mut queue = timer_queue.lock().unwrap();
+        queue.push(Msg::Clients(airfork::clients()));
+        queue.push(Msg::Refresh(airfork::status()));
         glib::ControlFlow::Continue
     });
 
@@ -304,6 +385,7 @@ fn build_ui(app: &adw::Application) {
             password: pass_value.clone(),
             ap_interface: iface_value.clone(),
             country: "KE".into(),
+            uplink: selected_string(&ui.source),
         };
         if let Err(error) = config.validate() {
             log(&ui.log, &format!("bad config: {error}"));
@@ -320,6 +402,11 @@ fn build_ui(app: &adw::Application) {
                 "--ap-interface".to_string(),
                 config.ap_interface.clone(),
             ];
+            let mut args = args;
+            if let Some(source) = &config.uplink {
+                args.push("--uplink".to_string());
+                args.push(source.clone());
+            }
             let result = privileged(&args).map_err(|error| error.to_string());
             queue.lock().unwrap().push(Msg::Started(result));
             queue.lock().unwrap().push(Msg::Refresh(status()));

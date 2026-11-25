@@ -40,6 +40,8 @@ enum Command {
         ap_interface: Option<String>,
         #[arg(long)]
         country: Option<String>,
+        #[arg(long, value_name = "IFACE")]
+        uplink: Option<String>,
     },
     /// Start the virtual access point; requires root
     Start {
@@ -51,7 +53,11 @@ enum Command {
         ap_interface: Option<String>,
         #[arg(long)]
         country: Option<String>,
+        #[arg(long, value_name = "IFACE")]
+        uplink: Option<String>,
     },
+    /// List interfaces that can provide the internet uplink
+    Sources,
     /// Stop the virtual access point and remove its resources; requires root
     Stop,
     /// Report the active session and the adapter state
@@ -66,6 +72,7 @@ fn config_from(
     password: Option<String>,
     ap_interface: Option<String>,
     country: Option<String>,
+    uplink: Option<String>,
 ) -> HotspotConfig {
     let mut config = HotspotConfig::default();
     if let Some(value) = ssid {
@@ -79,6 +86,9 @@ fn config_from(
     }
     if let Some(value) = country {
         config.country = value;
+    }
+    if let Some(value) = uplink {
+        config.uplink = Some(value);
     }
     config
 }
@@ -175,8 +185,9 @@ fn main() -> Result<()> {
             password,
             ap_interface,
             country,
+            uplink,
         } => {
-            let config = config_from(ssid, password, ap_interface, country);
+            let config = config_from(ssid, password, ap_interface, country, uplink);
             out!("{}", plan(&config)?);
         }
         Command::Start {
@@ -184,8 +195,9 @@ fn main() -> Result<()> {
             password,
             ap_interface,
             country,
+            uplink,
         } => {
-            let config = config_from(ssid, password, ap_interface, country);
+            let config = config_from(ssid, password, ap_interface, country, uplink);
             let state = start(&config)?;
             out!("Hotspot \"{}\" is running on {}", state.ssid, state.ap_interface);
             if let Some(notice) = &state.notice {
@@ -193,6 +205,11 @@ fn main() -> Result<()> {
             }
             out!("Clients receive an address on {} and reach the uplink through NAT.", state.gateway);
             out!("Stop it with: airfork stop");
+        }
+        Command::Sources => {
+            for source in airfork::sources() {
+                out!("{source}");
+            }
         }
         Command::Stop => {
             stop()?;
