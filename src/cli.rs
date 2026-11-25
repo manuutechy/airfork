@@ -188,6 +188,9 @@ fn main() -> Result<()> {
             let config = config_from(ssid, password, ap_interface, country);
             let state = start(&config)?;
             out!("Hotspot \"{}\" is running on {}", state.ssid, state.ap_interface);
+            if let Some(notice) = &state.notice {
+                out!("Note         {notice}");
+            }
             out!("Clients receive an address on {} and reach the uplink through NAT.", state.gateway);
             out!("Stop it with: airfork stop");
         }

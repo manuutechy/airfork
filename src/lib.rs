@@ -370,6 +370,9 @@ pub struct RuntimeState {
     pub hostapd_pid: u32,
     pub dnsmasq_pid: u32,
     pub ip_forward_before: String,
+    pub pinned_connection: Option<String>,
+    pub bssid_before: Option<String>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +419,95 @@ fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+// find a 2.4 GHz radio of the same network. iwlwifi marks 5 GHz as passive
+// scan here, so an AP can only transmit on 2.4 GHz on this hardware.
+fn find_24ghz_bssid(interface: &str, ssid: &str) -> Option<String> {
+    let _ = interface;
+    let list = stdout("nmcli", &["-t", "-f", "SSID,BSSID,FREQ", "dev", "wifi", "list"]).ok()?;
+    for line in list.lines() {
+        let fields = split_escaped(line);
+        if fields.len() < 3 || fields[0] != ssid {
+            continue;
+        }
+        let Some(freq) = fields[2]
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if (2412..=2484).contains(&freq) {
+            return Some(fields[1].clone());
+        }
+    }
+    None
+}
+
+// nmcli escapes colons in terse mode, so a plain split will not do
+fn split_escaped(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && matches!(chars.peek(), Some(':') | Some('\\')) {
+            current.push(chars.next().unwrap());
+        } else if ch == ':' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+// returns the capability after the switch, plus what stop() needs to undo
+fn ensure_ap_band(capability: &Capability) -> Result<(Capability, Option<(String, Option<String>)>)> {
+    if capability.band == Some(Band::B2_4) {
+        return Ok((capability.clone(), None));
+    }
+    let ssid = capability
+        .uplink_ssid
+        .as_ref()
+        .context("cannot pick a 2.4 GHz BSSID for a hidden uplink")?;
+    let bssid = find_24ghz_bssid(&capability.uplink, ssid)
+        .context("no 2.4 GHz BSSID found for this network; an AP cannot transmit on the current channel")?;
+    let name = stdout("nmcli", &["-g", "GENERAL.CONNECTION", "dev", "show", &capability.uplink])?
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        bail!("the uplink is not managed by NetworkManager, so it cannot be pinned automatically");
+    }
+    let previous = stdout("nmcli", &["-g", "802-11-wireless.bssid", "con", "show", &name])?
+        .trim()
+        .to_string();
+    let previous = if previous.is_empty() { None } else { Some(previous) };
+
+    run(
+        "nmcli",
+        &["con", "mod", &name, "802-11-wireless.bssid", &bssid],
+    )?;
+    if let Err(error) = run("nmcli", &["con", "up", &name]) {
+        let restore = previous.clone().unwrap_or_default();
+        let _ = run(
+            "nmcli",
+            &["con", "mod", &name, "802-11-wireless.bssid", &restore],
+        );
+        return Err(error);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let updated = detect()?;
+    if updated.band != Some(Band::B2_4) {
+        let restore = previous.clone().unwrap_or_default();
+        let _ = run(
+            "nmcli",
+            &["con", "mod", &name, "802-11-wireless.bssid", &restore],
+        );
+        bail!("the uplink did not move to 2.4 GHz; hotspot not started");
+    }
+    Ok((updated, Some((name, previous))))
+}
+
 pub fn plan(config: &HotspotConfig) -> Result<String> {
     config.validate()?;
     let capability = detect()?;
@@ -431,8 +523,24 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
     let band = capability
         .band
         .context("the uplink frequency could not be classified")?;
+    let switch_note = if band != Band::B2_4 {
+        match capability.uplink_ssid.as_deref().and_then(|ssid| {
+            find_24ghz_bssid(&capability.uplink, ssid)
+        }) {
+            Some(bssid) => format!("Switch    uplink will be pinned to 2.4 GHz BSSID {bssid}\n"),
+            None => "Warning   no 2.4 GHz BSSID found; AP may not transmit on this channel\n".into(),
+        }
+    } else {
+        String::new()
+    };
+    let ap_band = if switch_note.starts_with("Switch") {
+        Band::B2_4
+    } else {
+        band
+    };
+    let ap_channel = if ap_band != band { 1 } else { channel };
     Ok(format!(
-        "Uplink       {} on {} channel {} ({} MHz, {})\n\
+        "{switch_note}Uplink       {} on {} channel {} ({} MHz, {})\n\
          Virtual AP  {} with MAC {}\n\
          Hotspot     \"{}\" on {} channel {} (WPA2)\n\
          Network     192.168.42.0/24, DHCP 192.168.42.10 through 100\n\
@@ -447,8 +555,8 @@ pub fn plan(config: &HotspotConfig) -> Result<String> {
         config.ap_interface,
         AP_MAC,
         config.ssid,
-        band.label(),
-        channel,
+        ap_band.label(),
+        ap_channel,
         config.ap_interface,
         capability.uplink
     ))
@@ -478,6 +586,15 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         stop().context("could not clear the previous session")?;
     }
 
+    let (capability, pin) = ensure_ap_band(&capability)?;
+    let (pinned_connection, bssid_before) = match pin {
+        Some((name, old)) => (Some(name), old),
+        None => (None, None),
+    };
+    let notice = pinned_connection
+        .as_ref()
+        .map(|_| "uplink moved to 2.4 GHz so the AP could transmit".to_string());
+
     let channel = capability
         .channel
         .context("the uplink has no channel; connect to a Wi-Fi network first")?;
@@ -494,6 +611,8 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         .trim()
         .to_string();
 
+    // a failed previous run can leave the interface behind
+    let _ = run("iw", &["dev", &config.ap_interface, "del"]);
     run(
         "iw",
         &[
@@ -570,6 +689,9 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
             hostapd_pid,
             dnsmasq_pid,
             ip_forward_before: forward_before.clone(),
+            pinned_connection: pinned_connection.clone(),
+            bssid_before: bssid_before.clone(),
+            notice: notice.clone(),
         })
     })();
 
@@ -607,6 +729,13 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                 format!("{}\n", forward_before),
             );
             let _ = run("iw", &["dev", &config.ap_interface, "del"]);
+            if let Some(name) = &pinned_connection {
+                let restore = bssid_before.clone().unwrap_or_default();
+                let _ = run(
+                    "nmcli",
+                    &["con", "mod", name, "802-11-wireless.bssid", &restore],
+                );
+            }
             Err(error)
         }
     }
@@ -653,6 +782,13 @@ pub fn stop() -> Result<()> {
         format!("{}\n", state.ip_forward_before),
     );
     let _ = run("iw", &["dev", &state.ap_interface, "del"]);
+    if let Some(name) = &state.pinned_connection {
+        let restore = state.bssid_before.clone().unwrap_or_default();
+        let _ = run(
+            "nmcli",
+            &["con", "mod", name, "802-11-wireless.bssid", &restore],
+        );
+    }
     let _ = fs::remove_file(STATE_FILE);
     Ok(())
 }
@@ -721,6 +857,14 @@ mod tests {
         assert!(blocks[0].contains("managed") && !blocks[0].contains("AP"));
         assert!(blocks[1].contains("managed") && blocks[1].contains("AP"));
         assert_eq!(max_channels(&blocks[1]), Some(1));
+    }
+
+    #[test]
+    fn terse_nmcli_fields() {
+        let fields = split_escaped(r"The Great Failure:D8\:42\:F7\:D6\:89\:ED:2412 MHz");
+        assert_eq!(fields[0], "The Great Failure");
+        assert_eq!(fields[1], "D8:42:F7:D6:89:ED");
+        assert_eq!(fields[2], "2412 MHz");
     }
 
     #[test]
