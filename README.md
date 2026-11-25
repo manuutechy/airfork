@@ -1,23 +1,43 @@
 # airfork
 
-Experimental Linux tool that forks one Wi-Fi radio into two: it keeps the
-station connection up and puts a virtual access point next to it, so other
-devices can share the uplink. No second adapter needed on cards like the
-Intel 9260 / AX200 where `iwlwifi` allows `managed` + `AP` at the same time.
+Experimental Linux tool that shares a Wi-Fi uplink over a second, virtual Wi-Fi
+access point on the **same physical card**. The laptop stays connected to its
+network while other devices join the hotspot and browse through it.
 
-This is a toy for lab use. Expect rough edges.
+Built by Meshack Bahati. Free software under the MIT licence, see `LICENSE`.
 
-## the catch
+![airfork GUI](screenshots/gui-cropped.png)
 
-On `iwlwifi` the two interfaces have to sit on the same channel. That means
-the hotspot channel follows the uplink channel, not the other way round. If
-the uplink moves, stop and start again. Throughput is shared between the two
-roles because there is only one transmitter.
+## the problem it solves
 
-`nmcli dev wifi hotspot` cannot do this, it takes the card over and drops
-the station connection. airfork adds a virtual `__ap` interface and runs
-hostapd and dnsmasq on it instead, which is the trick Windows hides behind
-its Mobile Hotspot toggle.
+On Windows, Mobile Hotspot is a single toggle. Behind the scenes Windows
+creates a virtual Wi-Fi adapter, pins it to a usable channel, and hides the
+DHCP and NAT setup.
+
+Linux has no equivalent one-command switch. The obvious command,
+`nmcli dev wifi hotspot`, turns the physical card into an access point and
+**drops the existing Wi-Fi connection**. Most guides therefore tell you to buy
+a second USB Wi-Fi dongle.
+
+On Intel cards such as the 9260 and AX200, the driver already supports one
+station interface and one AP interface at the same time. What is missing is
+the glue. airfork provides that glue:
+
+- reads `iw phy ... info` to confirm that `managed` and `AP` can coexist;
+- stops NetworkManager from grabbing the virtual interface before hostapd
+  can use it;
+- works around the regulatory block that marks 5 GHz channels as passive-scan
+  on these adapters by limiting the uplink to 2.4 GHz, where an AP may transmit;
+- tells wpa_supplicant to ignore the router's 802.11v "move to another band"
+  requests for the duration of the session, which otherwise causes the uplink
+  to drop every few minutes;
+- runs hostapd and dnsmasq, adds a marked NAT rule, and tears all of it down
+  again on `stop`.
+
+## requirements
+
+`iw`, `ip`, `hostapd`, `dnsmasq`, `iptables`, NetworkManager and a C compiler
+toolchain for the GTK crates. The GUI needs a GTK4 / libadwaita session.
 
 ## build and install
 
@@ -26,31 +46,45 @@ cargo build --release
 ./install.sh
 ```
 
-`install.sh` drops the cli in `/usr/local/bin`, the gui in `~/.local/bin`, a
-desktop launcher, and a polkit action so pkexec asks once per session instead
-of on every button press. Needs `iw`, `ip`, `hostapd`, `dnsmasq`, `iptables`
-and NetworkManager.
+`install.sh` puts the CLI in `/usr/local/bin`, the GUI in `~/.local/bin`, adds
+a desktop launcher, and installs a polkit action so the privileged buttons
+ask once per session instead of on every click.
 
 ## use
 
 ```sh
-./target/release/airfork detect
-./target/release/airfork plan
-sudo ./target/release/airfork start --ssid LabHotspot --password somethinglong
-./target/release/airfork status
-sudo ./target/release/airfork stop
+airfork detect                     # read only, works as a normal user
+airfork plan                       # what start would do
+sudo airfork start --ssid LabHotspot --password airfork-2026
+airfork status
+sudo airfork stop
 ```
 
-`detect` is read only and works as a normal user. `start` and `stop` need
-root. `stop` removes the virtual interface, kills the two daemons, drops the
-NAT rule and restores `ip_forward`.
+The GUI exposes the same operations. Press **Start hotspot**, then **Stop
+hotspot** when finished. The default credentials are `LabHotspot` and
+`airfork-2026`; change them in the window before starting. `start` needs root
+through `sudo` or `pkexec`. All changes are reverted by `stop`.
 
-There is also `airfork-gui` with the same buttons for people who would
-rather click than type. It shells out through `pkexec` for privileged bits.
+## the catch
 
-## why the tool exists
+- One radio means one channel. `iwlwifi` reports `#channels <= 1` for AP plus
+  station, so the hotspot follows the uplink channel rather than choosing its
+  own. Since 5 GHz is passive-scan here, the uplink is moved to 2.4 GHz for the
+  duration of the session. That is a short reconnect at start, not a dropped
+  connection.
+- Throughput is shared between the uplink and the clients.
+- The connection profile is limited to band `bg` while running and restored
+  on stop. The station stays on 2.4 GHz until it reconnects by itself.
+- 802.11v BTM handling is disabled while running so the router cannot steer
+  the station back to 5 GHz mid-session. It is restored on stop.
+- This is a lab tool for sharing your own connection, not a jamming tool.
 
-Because the capability is already in the driver and the missing piece is a
-few lines of glue. The whole thing just reads `iw phy ... info`, checks that
-`managed` and `AP` appear in one interface-combination block, then wires up
-the same channel and hands off to the normal Linux networking stack.
+## layout
+
+```
+src/lib.rs   capability detection, start, stop, status and rollback
+src/cli.rs   command-line frontend
+src/gui.rs   GTK / libadwaita frontend
+```
+
+Licensed under the MIT License. Copyright (c) 2026 Meshack Bahati.

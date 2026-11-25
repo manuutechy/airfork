@@ -1,12 +1,10 @@
-//! tiny gtk window for people who don't like typing
-//!
-//! read-only bits call the library directly. start/stop shell out to the cli
-//! through pkexec, so the gui itself stays unprivileged.
+//! gtk window. read-only calls go straight to the library, privileged ones
+//! go through pkexec on the cli binary so the ui itself stays unprivileged.
 
 use anyhow::{Context, Result};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Box, Button, Entry, Label, Orientation, ScrolledWindow, TextView, WrapMode};
+use gtk4::{Box, Button, Label, Orientation, ScrolledWindow, TextView, WrapMode};
 use libadwaita as adw;
 use adw::prelude::*;
 
@@ -23,12 +21,28 @@ enum Msg {
 
 type Queue = Arc<Mutex<Vec<Msg>>>;
 
+#[derive(Clone)]
+struct Ui {
+    uplink: adw::ActionRow,
+    channel: adw::ActionRow,
+    mode: adw::ActionRow,
+    session: adw::ActionRow,
+    combos: adw::ExpanderRow,
+    combo_rows: Arc<Mutex<Vec<adw::ActionRow>>>,
+    log: TextView,
+}
+
 fn main() {
     let app = adw::Application::builder()
         .application_id("dev.airfork.Gui")
         .build();
     app.connect_activate(build_ui);
     app.run();
+}
+
+// adw row titles go through pango markup, and capability strings contain "<="
+fn escaped(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn log(view: &TextView, line: &str) {
@@ -49,7 +63,6 @@ fn cli_path() -> Result<PathBuf> {
     Ok(PathBuf::from("airfork"))
 }
 
-// pkexec prompts on a desktop, which beats typing a sudo password into a box
 fn privileged(args: &[String]) -> Result<String> {
     let cli = cli_path()?;
     let mut command = if airfork::is_root() {
@@ -69,62 +82,72 @@ fn privileged(args: &[String]) -> Result<String> {
     }
 }
 
-fn handle_msg(msg: Msg, detail: &Label, log_view: &TextView) {
+fn handle_msg(msg: Msg, ui: &Ui) {
     match msg {
         Msg::Refresh(info) => {
-            let mut lines = Vec::new();
-            match &info.capability {
-                Some(cap) => {
-                    lines.push(format!(
-                        "{} / {} — {}",
-                        cap.phy,
-                        cap.uplink,
-                        cap.uplink_ssid.as_deref().unwrap_or("<hidden>")
-                    ));
-                    match (cap.channel, cap.frequency_mhz, cap.band) {
-                        (Some(ch), Some(freq), Some(band)) => lines.push(format!(
-                            "uplink: channel {ch} ({freq} MHz, {})",
-                            band.label()
-                        )),
-                        _ => lines.push("uplink: not connected".into()),
+            if let Some(cap) = &info.capability {
+                ui.uplink.set_subtitle(&format!(
+                    "{} / {} / {}",
+                    cap.uplink,
+                    cap.uplink_ssid.as_deref().unwrap_or("<hidden>"),
+                    cap.phy
+                ));
+                match (cap.channel, cap.frequency_mhz, cap.band) {
+                    (Some(channel), Some(freq), Some(band)) => ui
+                        .channel
+                        .set_subtitle(&format!("{} — {} MHz, {}", channel, freq, band.label())),
+                    _ => ui.channel.set_subtitle("not connected"),
+                }
+                ui.mode.set_subtitle(&format!(
+                    "{} · same channel {}",
+                    if cap.concurrent { "supported" } else { "unsupported" },
+                    if cap.same_channel_required { "required" } else { "optional" }
+                ));
+
+                {
+                    let mut added = ui.combo_rows.lock().unwrap();
+                    for row in added.iter() {
+                        ui.combos.remove(row);
                     }
-                    lines.push(format!(
-                        "concurrent AP+STA: {}",
-                        if cap.concurrent { "yes" } else { "no" }
-                    ));
-                    lines.push(format!(
-                        "same channel required: {}",
-                        if cap.same_channel_required { "yes" } else { "no" }
-                    ));
+                    added.clear();
                     for combination in &cap.combinations {
-                        lines.push(format!("  {combination}"));
+                        let row = adw::ActionRow::builder().title(escaped(combination)).build();
+                        ui.combos.add_row(&row);
+                        added.push(row);
                     }
                 }
-                None => lines.push("adapter unavailable".into()),
+                ui.combos.set_subtitle(&format!(
+                    "{} reported by the driver",
+                    cap.combinations.len()
+                ));
+            } else {
+                ui.uplink.set_subtitle("adapter unavailable");
+                ui.channel.set_subtitle("—");
+                ui.mode.set_subtitle("—");
             }
+
             match &info.state {
-                Some(state) => lines.push(format!(
-                    "session: {} ({} on {})",
+                Some(state) => ui.session.set_subtitle(&format!(
+                    "{} — {} on {}",
                     if info.running { "running" } else { "stale" },
                     state.ssid,
                     state.ap_interface
                 )),
-                None => lines.push("session: not running".into()),
+                None => ui.session.set_subtitle("not running"),
             }
-            detail.set_label(&lines.join("\n"));
         }
         Msg::Started(result) => match result {
             Ok(text) => {
-                log(log_view, "started");
+                log(&ui.log, "started");
                 for line in text.lines() {
-                    log(log_view, line);
+                    log(&ui.log, line);
                 }
             }
-            Err(error) => log(log_view, &format!("start failed: {error}")),
+            Err(error) => log(&ui.log, &format!("start failed: {error}")),
         },
         Msg::Stopped(result) => match result {
-            Ok(()) => log(log_view, "stopped"),
-            Err(error) => log(log_view, &format!("stop failed: {error}")),
+            Ok(()) => log(&ui.log, "stopped"),
+            Err(error) => log(&ui.log, &format!("stop failed: {error}")),
         },
     }
 }
@@ -132,81 +155,135 @@ fn handle_msg(msg: Msg, detail: &Label, log_view: &TextView) {
 fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("airfork — experimental wifi share")
-        .default_width(560)
+        .title("airfork")
+        .default_width(480)
         .default_height(640)
         .build();
 
+    let header = adw::HeaderBar::new();
+    let refresh = Button::from_icon_name("view-refresh-symbolic");
+    refresh.set_tooltip_text(Some("Refresh adapter state"));
+    header.pack_end(&refresh);
+
+    let page = adw::PreferencesPage::new();
+
+    let adapter = adw::PreferencesGroup::builder()
+        .title("Adapter")
+        .description("what this machine can do")
+        .build();
+    let uplink = adw::ActionRow::builder()
+        .title("Uplink")
+        .subtitle("checking...")
+        .build();
+    let channel = adw::ActionRow::builder().title("Channel").subtitle("—").build();
+    let mode = adw::ActionRow::builder()
+        .title("Concurrent AP + station")
+        .subtitle("—")
+        .build();
+    let session = adw::ActionRow::builder()
+        .title("Session")
+        .subtitle("not running")
+        .build();
+    let combos = adw::ExpanderRow::builder()
+        .title("Interface combinations")
+        .subtitle("driver details")
+        .build();
+    adapter.add(&uplink);
+    adapter.add(&channel);
+    adapter.add(&mode);
+    adapter.add(&session);
+    adapter.add(&combos);
+    page.add(&adapter);
+
+    let hotspot = adw::PreferencesGroup::builder()
+        .title("Hotspot")
+        .description("what connecting devices will see")
+        .build();
+    let ssid = adw::EntryRow::builder()
+        .title("Network name")
+        .text("LabHotspot")
+        .build();
+    let password = adw::PasswordEntryRow::builder()
+        .title("Password")
+        .text("airfork-2026")
+        .build();
+    let iface = adw::EntryRow::builder()
+        .title("Virtual interface")
+        .text("wlan0_ap")
+        .build();
+    hotspot.add(&ssid);
+    hotspot.add(&password);
+    hotspot.add(&iface);
+    page.add(&hotspot);
+
     let root = Box::builder()
         .orientation(Orientation::Vertical)
-        .spacing(10)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
+        .spacing(12)
         .build();
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(560);
+    clamp.set_child(Some(&page));
+    root.append(&clamp);
 
-    let headline = Label::builder().label("one radio, two jobs").xalign(0.0).build();
-    headline.add_css_class("title-1");
-
-    let detail = Label::builder()
-        .label("checking adapter...")
-        .xalign(0.0)
-        .wrap(true)
-        .selectable(true)
-        .build();
-
-    let ssid = Entry::builder().placeholder_text("hotspot ssid").build();
-    ssid.set_text("LabHotspot");
-    let password = Entry::builder().placeholder_text("wpa2 password").build();
-    password.set_text("airfork-2026");
-    password.set_visibility(false);
-    let iface = Entry::builder().placeholder_text("virtual interface").build();
-    iface.set_text("wlan0_ap");
-
-    let buttons = Box::builder()
+    let actions = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(8)
+        .margin_start(24)
+        .margin_end(24)
         .build();
-    let start = Button::with_label("start");
-    let stop = Button::with_label("stop");
-    let refresh = Button::with_label("refresh");
-    buttons.append(&start);
-    buttons.append(&stop);
-    buttons.append(&refresh);
+    let start = Button::with_label("Start hotspot");
+    start.add_css_class("suggested-action");
+    let stop = Button::with_label("Stop hotspot");
+    actions.append(&start);
+    actions.append(&stop);
+    root.append(&actions);
 
+    let output = Box::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(6)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_bottom(16)
+        .build();
+    let output_label = Label::builder().label("Output").xalign(0.0).build();
+    output_label.add_css_class("dim-label");
     let log_view = TextView::builder()
         .editable(false)
         .wrap_mode(WrapMode::Word)
         .build();
-    log_view.set_height_request(170);
+    log_view.add_css_class("monospace");
+    log_view.set_height_request(120);
     let scroller = ScrolledWindow::builder()
         .child(&log_view)
-        .min_content_height(170)
+        .min_content_height(120)
         .build();
+    output.append(&output_label);
+    output.append(&scroller);
+    root.append(&output);
 
-    root.append(&headline);
-    root.append(&detail);
-    root.append(&Label::builder().label("hotspot name").xalign(0.0).build());
-    root.append(&ssid);
-    root.append(&Label::builder().label("password (8+ characters)").xalign(0.0).build());
-    root.append(&password);
-    root.append(&Label::builder().label("virtual interface name").xalign(0.0).build());
-    root.append(&iface);
-    root.append(&buttons);
-    root.append(&scroller);
-    window.set_content(Some(&root));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&root));
+    window.set_content(Some(&toolbar));
     window.present();
 
-    // no glib channel in 0.22, so a plain shared vec and an idle callback
+    let ui = Ui {
+        uplink: uplink.clone(),
+        channel: channel.clone(),
+        mode: mode.clone(),
+        session: session.clone(),
+        combos: combos.clone(),
+        combo_rows: Arc::new(Mutex::new(Vec::new())),
+        log: log_view.clone(),
+    };
+
     let queue: Queue = Arc::new(Mutex::new(Vec::new()));
     let ui_queue = queue.clone();
-    let ui_detail = detail.clone();
-    let ui_log = log_view.clone();
+    let ui_state = ui.clone();
     glib::source::idle_add_local(move || {
         let mut items = ui_queue.lock().unwrap();
         while let Some(msg) = items.pop() {
-            handle_msg(msg, &ui_detail, &ui_log);
+            handle_msg(msg, &ui_state);
         }
         drop(items);
         glib::ControlFlow::Continue
@@ -229,7 +306,7 @@ fn build_ui(app: &adw::Application) {
             country: "KE".into(),
         };
         if let Err(error) = config.validate() {
-            log(&log_view, &format!("bad config: {error}"));
+            log(&ui.log, &format!("bad config: {error}"));
             return;
         }
         let queue = start_queue.clone();

@@ -17,6 +17,8 @@ pub const HOSTAPD_CONF: &str = "/run/airfork/hostapd.conf";
 pub const DNSMASQ_CONF: &str = "/run/airfork/dnsmasq.conf";
 pub const HOSTAPD_PID: &str = "/run/airfork/hostapd.pid";
 pub const DNSMASQ_PID: &str = "/run/airfork/dnsmasq.pid";
+pub const HOSTAPD_LOG: &str = "/run/airfork/hostapd.log";
+pub const NM_CONF: &str = "/etc/NetworkManager/conf.d/99-airfork.conf";
 
 // locally administered, so it never collides with the station MAC
 pub const AP_MAC: &str = "02:00:00:00:01:01";
@@ -476,6 +478,50 @@ fn read_btm(interface: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
+// NM has to be told to leave the virtual interface alone before it appears.
+// Setting it unmanaged after creation is too late: NM and wpa_supplicant
+// already grabbed it and hostapd then cannot bring it up.
+fn hide_from_networkmanager(ap: &str) -> Result<()> {
+    fs::write(
+        NM_CONF,
+        format!(
+            "[keyfile]\nunmanaged-devices=interface-name:{ap};mac:{AP_MAC}\n"
+        ),
+    )?;
+    run("nmcli", &["general", "reload"])
+}
+
+fn unhide_from_networkmanager() {
+    let _ = fs::remove_file(NM_CONF);
+    let _ = run("nmcli", &["general", "reload"]);
+}
+
+// hostapd daemonises before it validates the config, so -B returning is not
+// proof that the AP is up. wait for the pidfile and the AP interface instead.
+fn wait_for_hostapd(ap: &str) -> Result<u32> {
+    for _ in 0..20 {
+        if let Ok(pid) = read_pid(HOSTAPD_PID) {
+            if process_alive(pid) {
+                let is_ap = stdout("iw", &["dev", ap, "info"])
+                    .map(|info| info.contains("type AP"))
+                    .unwrap_or(false);
+                if is_ap {
+                    return Ok(pid);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let detail = fs::read_to_string(HOSTAPD_LOG)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!("hostapd did not bring up {ap}{}", if detail.is_empty() { String::new() } else { format!(":\n{detail}") })
+}
+
 pub fn plan(config: &HotspotConfig) -> Result<String> {
     config.validate()?;
     let capability = detect()?;
@@ -572,6 +618,9 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         .trim()
         .to_string();
 
+    // NM must be out of the way before the interface exists
+    hide_from_networkmanager(&config.ap_interface)?;
+
     // a failed previous run can leave the interface behind
     let _ = run("iw", &["dev", &config.ap_interface, "del"]);
     run(
@@ -596,8 +645,13 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
         )?;
         let _ = run("nmcli", &["dev", "set", &config.ap_interface, "managed", "no"]);
 
-        run("hostapd", &["-B", "-P", HOSTAPD_PID, HOSTAPD_CONF])?;
-        let hostapd_pid = read_pid(HOSTAPD_PID)?;
+        let _ = fs::remove_file(HOSTAPD_PID);
+        let _ = fs::remove_file(HOSTAPD_LOG);
+        run(
+            "hostapd",
+            &["-B", "-P", HOSTAPD_PID, "-f", HOSTAPD_LOG, HOSTAPD_CONF],
+        )?;
+        let hostapd_pid = wait_for_hostapd(&config.ap_interface)?;
 
         run(
             "ip",
@@ -691,6 +745,7 @@ pub fn start(config: &HotspotConfig) -> Result<RuntimeState> {
                 format!("{}\n", forward_before),
             );
             let _ = run("iw", &["dev", &config.ap_interface, "del"]);
+            unhide_from_networkmanager();
             if let Some(name) = &pinned_connection {
                 let _ = restore_band(name, &band_before);
             }
@@ -744,6 +799,7 @@ pub fn stop() -> Result<()> {
         format!("{}\n", state.ip_forward_before),
     );
     let _ = run("iw", &["dev", &state.ap_interface, "del"]);
+    unhide_from_networkmanager();
     if let Some(name) = &state.pinned_connection {
         let _ = restore_band(name, &state.band_before);
     }
