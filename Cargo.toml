@@ -1,0 +1,30 @@
+[package]
+name = "airfork"
+version = "0.1.0"
+edition = "2024"
+description = "experimental linux tool that shares wifi over wifi without dropping the uplink"
+
+[lib]
+name = "airfork"
+path = "src/lib.rs"
+
+[[bin]]
+name = "airfork"
+path = "src/cli.rs"
+
+[[bin]]
+name = "airfork-gui"
+path = "src/gui.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gtk4 = "0.11"
+libadwaita = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
